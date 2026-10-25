@@ -1075,6 +1075,15 @@ def unified_attention(
     # 2D mode so Triton can skip materialising these pointer arguments.
     segm_output_ptr = softmax_segm_output if use_3d else None
     segm_max_ptr = softmax_segm_max if use_3d else None
+    # Turing (sm_75) has 64 KB of shared memory per block. With head_dim 512 (Gemma 4's global
+    # attention layers) the default prefill tile (32) and Triton's default stages need ~96 KB,
+    # so shrink the tiles to 16 and use a single stage there (~48 KB).
+    # Same idea as vllm-project/vllm#39018 by @lisp19.
+    if head_size_padded >= 512 and not current_platform.has_device_capability(80):
+        TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, 16)
+        TILE_SIZE_DECODE = min(TILE_SIZE_DECODE, 16)
+        launch_num_stages = 1
+
     segm_expsum_ptr = softmax_segm_expsum if use_3d else None
     num_segments = num_par_softmax_segments if use_3d else 1
 

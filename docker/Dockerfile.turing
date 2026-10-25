@@ -1,0 +1,15 @@
+# vLLM for Turing (sm_75: RTX 20xx / T4 / Quadro RTX).
+# Official v0.31.0 image + Triton with sm_75 tensor cores (t2ky/triton, branch turing-mma-v3.7.1)
+# + the attention tile fix from this branch.
+#
+# Build the Triton wheel first (see TURING.md), put it next to this file, then:
+#   docker build -f docker/Dockerfile.turing -t vllm-turing:v0.31.0 .
+FROM vllm/vllm-openai:v0.31.0
+
+COPY docker/triton-*.whl /tmp/
+RUN pip install --no-deps --force-reinstall /tmp/triton-*.whl && rm /tmp/triton-*.whl
+
+COPY vllm/v1/attention/ops/triton_unified_attention.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/triton_unified_attention.py
+
+RUN python3 -c "import triton, vllm; print('triton', triton.__version__, 'vllm', vllm.__version__)"
