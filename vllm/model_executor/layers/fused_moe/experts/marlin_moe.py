@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import contextlib
 import math
+import os
 from collections.abc import Callable
 
 import torch
@@ -55,6 +57,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+# [Turing] VLLM_TRITON_MOE_W4=1: eligible Marlin MoE calls use the Triton W4A16 grouped GEMM in
+# vllm/turing (see vllm/turing/moe_w4.py for the conditions).
+_TURING_MOE_W4 = None
+if os.environ.get("VLLM_TRITON_MOE_W4") == "1":
+    from vllm.turing import moe_w4 as _TURING_MOE_W4
 
 
 def _fused_marlin_moe(
@@ -301,6 +309,31 @@ def fused_marlin_moe(
         torch.Tensor: The output tensor after applying the MoE layer.
 
     """
+    if _TURING_MOE_W4 is not None:
+        out = _TURING_MOE_W4.fused_marlin_moe(
+            hidden_states, w1, w2, bias1, bias2, w1_scale, w2_scale, topk_weights,
+            topk_ids, quant_type_id,
+            dict(
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                activation=activation,
+                activation_func=activation_func,
+                moe_sum=moe_sum,
+                expert_map=expert_map,
+                input_global_scale1=input_global_scale1,
+                input_global_scale2=input_global_scale2,
+                global_scale1=global_scale1,
+                global_scale2=global_scale2,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
+                output=output,
+                input_dtype=input_dtype,
+                activation_config=activation_config,
+            ),
+        )
+        if out is not None:
+            return out
+
     quant_type = ScalarType.from_id(quant_type_id)
     assert quant_type in [
         scalar_types.uint4,
@@ -738,37 +771,42 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
-            fused_marlin_moe(
-                hidden_states=hidden_states,
-                w1=w1,
-                w2=w2,
-                bias1=self.w1_bias,
-                bias2=self.w2_bias,
-                w1_scale=self.w1_scale,
-                w2_scale=self.w2_scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                global_scale1=self.g1_alphas,
-                global_scale2=self.g2_alphas,
-                input_global_scale1=self.a1_gscale,
-                input_global_scale2=self.a2_gscale,
-                w1_zeros=self.w1_zp,
-                w2_zeros=self.w2_zp,
-                quant_type_id=self.quant_type_id,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                activation=activation,
-                activation_func=self.activation,
-                activation_config=self.activation_config,
-                moe_sum=self.moe_sum,
-                expert_map=expert_map,
-                output=output,
-                # Workspaces are swapped in workspace_shapes() to account for proper
-                # output buffer allocation. Please refer to workspace_shapes().
-                intermediate_cache13=workspace2,
-                intermediate_cache2=workspace13,
-                input_dtype=self.input_dtype,
-            )
+            with (
+                _TURING_MOE_W4.no_lora()
+                if _TURING_MOE_W4 is not None
+                else contextlib.nullcontext()
+            ):
+                fused_marlin_moe(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    bias1=self.w1_bias,
+                    bias2=self.w2_bias,
+                    w1_scale=self.w1_scale,
+                    w2_scale=self.w2_scale,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    global_scale1=self.g1_alphas,
+                    global_scale2=self.g2_alphas,
+                    input_global_scale1=self.a1_gscale,
+                    input_global_scale2=self.a2_gscale,
+                    w1_zeros=self.w1_zp,
+                    w2_zeros=self.w2_zp,
+                    quant_type_id=self.quant_type_id,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    activation=activation,
+                    activation_func=self.activation,
+                    activation_config=self.activation_config,
+                    moe_sum=self.moe_sum,
+                    expert_map=expert_map,
+                    output=output,
+                    # Workspaces are swapped in workspace_shapes() to account for proper
+                    # output buffer allocation. Please refer to workspace_shapes().
+                    intermediate_cache13=workspace2,
+                    intermediate_cache2=workspace13,
+                    input_dtype=self.input_dtype,
+                )
             return
 
         # LoRA path: wrap activation_func and moe_sum to inject LoRA at the
