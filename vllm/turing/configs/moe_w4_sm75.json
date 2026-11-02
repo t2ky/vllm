@@ -1,0 +1,170 @@
+{
+ "64": {
+  "BM": 16,
+  "w13": {
+   "BN": 128,
+   "BK": 32,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 32,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "BM_g": 16,
+  "g13": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 8,
+   "num_stages": 1
+  },
+  "g2": {
+   "BN": 128,
+   "BK": 32,
+   "num_warps": 2,
+   "num_stages": 2
+  }
+ },
+ "128": {
+  "BM": 16,
+  "w13": {
+   "BN": 128,
+   "BK": 32,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "BM_g": 16,
+  "g13": {
+   "BN": 256,
+   "BK": 128,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "g2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  }
+ },
+ "256": {
+  "BM": 32,
+  "w13": {
+   "BN": 128,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "BM_g": 32,
+  "g13": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "g2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 1
+  }
+ },
+ "512": {
+  "BM": 32,
+  "w13": {
+   "BN": 128,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "BM_g": 32,
+  "g13": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "g2": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  }
+ },
+ "1024": {
+  "BM": 32,
+  "w13": {
+   "BN": 128,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 128,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "BM_g": 32,
+  "g13": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "g2": {
+   "BN": 256,
+   "BK": 128,
+   "num_warps": 4,
+   "num_stages": 1
+  }
+ },
+ "2048": {
+  "BM": 64,
+  "w13": {
+   "BN": 128,
+   "BK": 32,
+   "num_warps": 4,
+   "num_stages": 2
+  },
+  "w2": {
+   "BN": 256,
+   "BK": 128,
+   "num_warps": 8,
+   "num_stages": 1
+  },
+  "BM_g": 32,
+  "g13": {
+   "BN": 256,
+   "BK": 64,
+   "num_warps": 4,
+   "num_stages": 1
+  },
+  "g2": {
+   "BN": 256,
+   "BK": 128,
+   "num_warps": 4,
+   "num_stages": 1
+  }
+ }
+}

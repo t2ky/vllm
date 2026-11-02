@@ -3,6 +3,7 @@
 
 
 import math
+import os
 
 import numpy
 import torch
@@ -437,6 +438,13 @@ def get_marlin_workspace(device: torch.device) -> torch.Tensor:
     )
 
 
+# [Turing] VLLM_CUDA_DENSE_W4=1: eligible dense Marlin GEMMs use the CUDA W4A16 / W8A16 kernel in
+# vllm/turing (see vllm/turing/dense_w4.py for the conditions).
+_TURING_DENSE_W4 = None
+if os.environ.get("VLLM_CUDA_DENSE_W4") == "1":
+    from vllm.turing import dense_w4 as _TURING_DENSE_W4
+
+
 def _marlin_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,
@@ -454,6 +462,13 @@ def _marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    if _TURING_DENSE_W4 is not None:
+        out = _TURING_DENSE_W4.marlin_gemm(
+            a, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros,
+            b_q_type_id, size_m, size_n, size_k,
+        )
+        if out is not None:
+            return out
     if workspace is None:
         workspace = get_marlin_workspace(a.device)
     return torch.ops._C.marlin_gemm(
