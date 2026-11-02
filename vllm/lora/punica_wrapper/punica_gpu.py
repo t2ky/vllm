@@ -8,12 +8,12 @@ https://arxiv.org/abs/2310.18547
 
 from typing import Any, final
 
+import numpy as np
 import torch
 
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.triton_utils import HAS_TRITON, triton
-from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import round_up
 
 if HAS_TRITON:
@@ -27,6 +27,15 @@ if HAS_TRITON:
 from vllm import _custom_ops as ops
 
 from .punica_base import PunicaWrapperBase
+
+
+def _to_slots(ids: tuple[int, ...], lut: dict[int, int]) -> np.ndarray:
+    """Map LoRA ids to slot indices on the CPU (same mapping as convert_mapping: id > 0 -> slot, else -1)."""
+    a = np.fromiter(ids, dtype=np.int64, count=len(ids))
+    out = np.full(a.shape, -1, dtype=np.int64)
+    for lid, i in lut.items():
+        out[a == lid] = i
+    return out
 
 
 @final
@@ -82,11 +91,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
 
-        # TODO avoid gpu<->cpu sync here
-        with gpu_sync_allowed():
-            # Prepare cuda kernel metadata tensors
-            self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
-            self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        # Build the kernel metadata from the CPU-side mapping. The GPU version (prepare_tensors) reads
+        # results back to the host every step, which breaks async scheduling overlap.
+        lut = {lid: i for i, lid in enumerate(lora_index_to_id) if lid is not None and lid > 0}
+        self.token_mapping_meta.prepare_tensors_from_cpu(_to_slots(mapping.index_mapping, lut))
+        self.prompt_mapping_meta.prepare_tensors_from_cpu(_to_slots(mapping.prompt_mapping, lut))
 
     def add_shrink(
         self,

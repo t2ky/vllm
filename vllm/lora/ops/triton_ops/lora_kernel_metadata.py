@@ -5,7 +5,14 @@
 import bisect
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
+
+
+def _h2d(dst: torch.Tensor, arr: np.ndarray) -> None:
+    """Copy a host array into the front of a GPU buffer through pinned memory, without waiting for the GPU."""
+    src = torch.from_numpy(arr).pin_memory()
+    dst[: arr.shape[0]].copy_(src, non_blocking=True)
 
 
 @dataclass
@@ -163,6 +170,38 @@ class LoRAKernelMeta:
         self.lora_token_start_loc[1 : 1 + lora_token_start_loc.size(0)].copy_(
             lora_token_start_loc, non_blocking=True
         )
+
+    def prepare_tensors_from_cpu(self, mapping: np.ndarray) -> None:
+        """Same result as prepare_tensors, computed from a host array (per-token LoRA slot, -1 for none).
+
+        prepare_tensors sorts and counts on the GPU and reads the results back to the host, which
+        synchronizes with the GPU every step and breaks the overlap of async scheduling (on hosts with a
+        slow CPU this was about half of the EngineCore CPU time). Here everything is computed with numpy
+        and only copied to the GPU.
+        """
+        self._reset()
+
+        no_lora = bool((mapping == -1).all())
+        self.no_lora_flag_cpu[0] = no_lora
+        if no_lora:
+            return
+
+        # same order as torch.sort(stable=True)
+        order = np.argsort(mapping, kind="stable").astype(np.int32)
+        lora_ids, num_tokens_per_lora = np.unique(mapping, return_counts=True)
+        _h2d(self.token_lora_mapping, mapping.astype(np.int32))
+        _h2d(self.token_indices_sorted_by_lora_ids, order)
+        _h2d(self.active_lora_ids, lora_ids.astype(np.int32))
+        _h2d(self.num_tokens_per_lora, num_tokens_per_lora.astype(np.int32))
+
+        num_active_loras = lora_ids.shape[0]
+        if self.captured_lora_counts and num_active_loras > 0:
+            idx = bisect.bisect_left(self.captured_lora_counts, num_active_loras)
+            if idx < len(self.captured_lora_counts):
+                num_active_loras = self.captured_lora_counts[idx]
+        self.num_active_loras_cpu[0] = num_active_loras
+
+        _h2d(self.lora_token_start_loc[1:], np.cumsum(num_tokens_per_lora).astype(np.int32))
 
     def meta_args(
         self,
