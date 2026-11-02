@@ -23,6 +23,9 @@ import os
 import torch
 
 _NO_LORA = contextvars.ContextVar("turing_moe_w4_no_lora", default=False)
+# Returned when the call is not handled (the caller runs Marlin). Not None: on the LoRA path the handled result is
+# moe_sum's return value, which is None, and treating that as "not handled" ran the MoE twice.
+NOT_HANDLED = object()
 STATS = {"fused": 0, "lora_gemm": 0, "marlin": 0}  # call counts, for checking
 
 
@@ -61,10 +64,10 @@ def _eligible(hidden_states, w1, w1_scale, quant_type_id, kw):
 
 def fused_marlin_moe(hidden_states, w1, w2, bias1, bias2, w1_scale, w2_scale, topk_weights, topk_ids,
                      quant_type_id, kw) -> torch.Tensor | None:
-    """Same arguments as vllm's fused_marlin_moe (keyword arguments in ``kw``). None = not handled."""
+    """Same arguments as vllm's fused_marlin_moe (keyword arguments in ``kw``). NOT_HANDLED = not handled."""
     if not _eligible(hidden_states, w1, w1_scale, quant_type_id, dict(kw, bias1=bias1, bias2=bias2)):
         STATS["marlin"] += 1
-        return None
+        return NOT_HANDLED
     from vllm.model_executor.layers.fused_moe.activation import (
         ApplyMoEActivationConfig,
         MoEActivation,

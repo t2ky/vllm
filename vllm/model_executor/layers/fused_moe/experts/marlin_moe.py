@@ -331,7 +331,7 @@ def fused_marlin_moe(
                 activation_config=activation_config,
             ),
         )
-        if out is not None:
+        if out is not _TURING_MOE_W4.NOT_HANDLED:
             return out
 
     quant_type = ScalarType.from_id(quant_type_id)
