@@ -91,6 +91,17 @@ class ShortConv(MambaBase, PluggableLayer):
         self.model_config = model_config
         self.cache_config = cache_config
         self.prefix = prefix
+        # Run the conv inside the CUDA graph (short_conv_graph). Speculative decoding and
+        # mamba_cache_mode="all" (per-block states) keep the original op (a graph split point).
+        # VLLM_SHORT_CONV_GRAPH=0 disables it.
+        import os
+
+        self.use_graph_conv = (
+            os.environ.get("VLLM_SHORT_CONV_GRAPH", "1") == "1"
+            and current_platform.is_cuda()
+            and self.num_spec == 0
+            and vllm_config.cache_config.mamba_cache_mode != "all"
+        )
 
     def forward_native(
         self,
@@ -206,11 +217,21 @@ class ShortConv(MambaBase, PluggableLayer):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
-        torch.ops.vllm.short_conv(
-            hidden_states,
-            output,
-            self.prefix,
+        # Keep in_proj / out_proj (quantized GEMM + LoRA) outside the custom op so that they are captured
+        # in the PIECEWISE CUDA graphs. The custom op (a graph split point; same name and signature as
+        # before) only does the conv. Otherwise, in mixed prefill/decode steps the linear layers and LoRA
+        # kernels are launched one by one outside the graph, which is CPU-bound on slow hosts.
+        BCx, _ = self.in_proj(hidden_states)
+        y = torch.empty(
+            (BCx.shape[0], BCx.shape[1] // 3), dtype=BCx.dtype, device=BCx.device
         )
+        if self.use_graph_conv:
+            # conv inside the CUDA graph as well (not a split point); reads only persistent GPU metadata
+            torch.ops.vllm.short_conv_graph(BCx, y, self.prefix)
+        else:
+            torch.ops.vllm.short_conv(BCx, y, self.prefix)
+        out, _ = self.out_proj(y)
+        output.copy_(out)
 
     def forward_cuda(
         self,
@@ -242,7 +263,8 @@ class ShortConv(MambaBase, PluggableLayer):
             num_accepted_tokens = attn_metadata.num_accepted_tokens
             query_start_loc_d = attn_metadata.query_start_loc_d
 
-        BCx, _ = self.in_proj(hidden_states)
+        # hidden_states is the in_proj output (BCx); output is the out_proj input (C * conv(B * x))
+        BCx = hidden_states
 
         B, C, x = BCx.chunk(3, dim=-1)
 
@@ -252,10 +274,8 @@ class ShortConv(MambaBase, PluggableLayer):
 
         if attn_metadata is None:
             # V1 profile run
-            Bx = (B * x).contiguous()
-            hidden_states = C * Bx
-            contextualized_states, _ = self.out_proj(hidden_states)
-            return contextualized_states
+            output.copy_(C * (B * x))
+            return
 
         num_prefills = attn_metadata.num_prefills  # request count
         num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
@@ -336,8 +356,9 @@ class ShortConv(MambaBase, PluggableLayer):
         # Merge prefill and decode outputs before passing to gated MLP
         hidden_states = torch.vstack(conv_output_list)
 
-        # Final linear projection
-        output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        output[:num_actual_tokens] = hidden_states
+        # zero the padding rows (do not feed garbage into the router of the following MoE)
+        output[num_actual_tokens:].zero_()
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None
@@ -377,4 +398,68 @@ direct_register_custom_op(
     op_name="short_conv",
     op_func=short_conv,
     mutates_args=["output"],
+)
+
+
+_GRAPH_CALLS = [0]
+
+
+def short_conv_graph(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """hidden_states = in_proj output (B, C, x); output = C * conv(B * x).
+    Not in splitting_ops, so it is captured in the piecewise CUDA graphs (this Python body does not run on
+    replay). The kernels read only the kv-cache state and the persistent buffers that
+    ShortConvAttentionMetadataBuilder writes every step."""
+    from vllm.model_executor.layers.mamba.ops.short_conv_graph import (
+        BUFFERS,
+        short_conv_graph_forward,
+    )
+
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    buf = BUFFERS.get(layer_name)
+    kv = self.kv_cache[0]
+    _GRAPH_CALLS[0] += 1  # times the Python body ran (not incremented by graph replays; for checking)
+    if kv.numel() == 0:
+        # profile run (before the kv-cache exists): values are unused
+        B, C, x = hidden_states.chunk(3, dim=-1)
+        output.copy_(C * (B * x))
+        return
+    if buf is None:
+        # The builder did not create the persistent buffers (e.g. VLLM_SHORT_CONV_GRAPH changed but a stale
+        # torch.compile cache was reused). Fail loudly instead of producing wrong outputs.
+        raise RuntimeError(
+            f"short_conv_graph: no persistent metadata for {layer_name}. After changing VLLM_SHORT_CONV_GRAPH "
+            "(or updating this code), clear the torch.compile cache (~/.cache/vllm/torch_compile_cache) or start "
+            "with VLLM_DISABLE_COMPILE_CACHE=1"
+        )
+    conv_state = kv if is_conv_state_dim_first() else kv.transpose(-1, -2)
+    conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
+    short_conv_graph_forward(
+        hidden_states,
+        output,
+        conv_weights,
+        self.conv.bias,
+        conv_state,
+        buf,
+        clear_armed=(layer_name == buf.last_layer),
+    )
+
+
+def short_conv_graph_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="short_conv_graph",
+    op_func=short_conv_graph,
+    mutates_args=["output"],
+    fake_impl=short_conv_graph_fake,
 )

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -46,6 +48,64 @@ class ShortConvAttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[ShortConvAttentionMetadata]
 ):
     metadata_cls = ShortConvAttentionMetadata
+    # Build per kv-cache group so the persistent buffers (short_conv_graph) get that group's state slots
+    supports_update_block_table = False
+
+    def __init__(
+        self,
+        kv_cache_spec: MambaSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._graph_buf = None
+        if (
+            type(self) is ShortConvAttentionMetadataBuilder
+            and os.environ.get("VLLM_SHORT_CONV_GRAPH", "1") == "1"
+            and device.type == "cuda"
+            and self.num_spec_tokens == 0
+            and vllm_config.cache_config.mamba_cache_mode != "all"
+        ):
+            from vllm.model_executor.layers.mamba.ops.short_conv_graph import (
+                BUFFERS,
+                ShortConvGraphBuffers,
+            )
+
+            max_reqs = vllm_config.scheduler_config.max_num_seqs
+            buf = ShortConvGraphBuffers(max_reqs, device)
+
+            def _idx(n: str) -> int:
+                m = re.search(r"layers\.(\d+)\.", n)
+                return int(m.group(1)) if m else -1
+
+            buf.last_layer = max(layer_names, key=_idx)
+            for n in layer_names:
+                BUFFERS[n] = buf
+            self._graph_buf = buf
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs: Any,
+    ) -> ShortConvAttentionMetadata:
+        metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build, **kwargs
+        )
+        if self._graph_buf is not None:
+            m = common_attn_metadata
+            n = metadata.num_decodes + metadata.num_prefills
+            self._graph_buf.write(
+                m.query_start_loc,
+                m.seq_lens,
+                metadata.state_indices_tensor_d,
+                metadata.state_indices_tensor_p,
+                n,
+                metadata.num_decodes,
+            )
+        return metadata
 
 
 @dataclass
