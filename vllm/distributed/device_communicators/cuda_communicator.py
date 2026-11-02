@@ -103,6 +103,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
+        # P2P の無い TP2 向けに、all-reduce をピン留め・mapped のホストメモリ経由で行う（VLLM_CE_AR=1、CUDA C++ 版、benchmarks/turing/ce_allreduce）。
+        # 番号は GPU のメモリ上のカウンタで持つので CUDA グラフの中でも使える
+        from vllm.distributed.device_communicators import ce_allreduce
+
+        self.ce_ar = ce_allreduce.maybe_create(self.cpu_group, self.rank_in_group, self.world_size, self.device)
+        if self.ce_ar is not None:
+            logger.info("host-memory all-reduce (ce_ar): small<=%dKB direct, large=%s chunk=%dKB blk=%dKB "
+                        "np=%d max=%dMB min=%dKB graph=%s", self.ce_ar.small_max >> 10, self.ce_ar.large,
+                        self.ce_ar.chunk >> 10, self.ce_ar.blk >> 10, self.ce_ar.np, self.ce_ar.max_bytes >> 20,
+                        self.ce_ar.min_bytes >> 10, self.ce_ar.graph)
+
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
@@ -333,6 +344,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        if self.ce_ar is not None:
+            out = self.ce_ar.maybe_all_reduce(input_)
+            if out is not None:
+                return out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
