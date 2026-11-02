@@ -1,15 +1,36 @@
 # vLLM for Turing (sm_75: RTX 20xx / T4 / Quadro RTX).
-# Official v0.31.0 image + Triton with sm_75 tensor cores (t2ky/triton, branch turing-mma-v3.7.1)
-# + the attention tile fix from this branch.
+# Official v0.31.0 image + Triton with sm_75 tensor cores (t2ky/triton, branch turing-pipeline-v3.7.1)
+# + the files this branch changes + the CUDA extensions in csrc/turing, built here for sm_75 (SASS + PTX).
+# See TURING.md for what each part does and which environment variables enable it.
 #
-# Build the Triton wheel first (see TURING.md), put it next to this file, then:
+# Build the Triton wheel first (see TURING.md), put it in docker/, then from the repository root:
 #   docker build -f docker/Dockerfile.turing -t vllm-turing:v0.31.0 .
 FROM vllm/vllm-openai:v0.31.0
 
+ARG SITE=/usr/local/lib/python3.12/dist-packages
+
+# 1. Triton with MMAv2 on sm_75 (and the opt-in TRITON_TURING_PIPELINE)
 COPY docker/triton-*.whl /tmp/
 RUN pip install --no-deps --force-reinstall /tmp/triton-*.whl && rm /tmp/triton-*.whl
 
-COPY vllm/v1/attention/ops/triton_unified_attention.py \
-     /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/triton_unified_attention.py
+# 2. vLLM files changed on this branch (v0.31.0 sources with the Turing changes)
+COPY vllm/v1/attention/ops/triton_unified_attention.py ${SITE}/vllm/v1/attention/ops/
+COPY vllm/v1/attention/backends/triton_attn.py \
+     vllm/v1/attention/backends/short_conv_attn.py \
+     ${SITE}/vllm/v1/attention/backends/
+COPY vllm/lora/ops/triton_ops/lora_kernel_metadata.py ${SITE}/vllm/lora/ops/triton_ops/
+COPY vllm/lora/punica_wrapper/punica_gpu.py ${SITE}/vllm/lora/punica_wrapper/
+COPY vllm/model_executor/layers/mamba/short_conv.py ${SITE}/vllm/model_executor/layers/mamba/
+COPY vllm/model_executor/layers/mamba/ops/short_conv_graph.py ${SITE}/vllm/model_executor/layers/mamba/ops/
+COPY vllm/model_executor/layers/quantization/utils/marlin_utils.py ${SITE}/vllm/model_executor/layers/quantization/utils/
+COPY vllm/model_executor/layers/fused_moe/experts/marlin_moe.py ${SITE}/vllm/model_executor/layers/fused_moe/experts/
+COPY vllm/turing/ ${SITE}/vllm/turing/
 
-RUN python3 -c "import triton, vllm; print('triton', triton.__version__, 'vllm', vllm.__version__)"
+# 3. CUDA extensions (decode attention, W4A16/W8A16 GEMM), compiled now so nothing is built at runtime
+COPY csrc/turing/ /tmp/csrc-turing/
+RUN MAX_JOBS=4 python3 -m vllm.turing._ext build /tmp/csrc-turing ${SITE}/vllm/turing/_ext \
+    && rm -rf /tmp/csrc-turing \
+    && ls -la ${SITE}/vllm/turing/_ext
+
+RUN python3 -c "import triton, vllm; print('triton', triton.__version__, 'vllm', vllm.__version__)" \
+    && python3 -c "import vllm.turing.cuda_w4, vllm.turing.cuda_attn, vllm.turing.moe_w4k, vllm.turing.dense_w4, vllm.turing.moe_w4"
