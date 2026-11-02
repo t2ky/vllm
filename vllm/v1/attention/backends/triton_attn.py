@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -47,6 +48,13 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# [Turing] VLLM_CUDA_DECODE_ATTN=1: decode-only batches (max_query_len == 1) use the CUDA C++ decode
+# attention kernel (vllm/turing/cuda_attn.py, csrc/turing/decode_attn_sm75.cu).
+_CUDA_ATTN = None
+_CUDA_ATTN_LOGGED: set = set()
+if os.environ.get("VLLM_CUDA_DECODE_ATTN") == "1":
+    from vllm.turing import cuda_attn as _CUDA_ATTN
 
 
 # constants
@@ -548,6 +556,41 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
 
+        # [Turing] Can the CUDA decode kernel handle this layer? (fixed set of shapes; otherwise Triton)
+        self._cuda_decode = (
+            _CUDA_ATTN is not None
+            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and attn_type == AttentionType.DECODER
+            and self.alibi_slopes is None
+            and sinks is None
+            and chunk_lookback == -1
+            and head_size in (64, 128, 256, 512)
+            and num_heads % num_kv_heads == 0
+            and (num_heads // num_kv_heads <= 8 or (num_heads // num_kv_heads) % ((num_heads // num_kv_heads + 7) // 8) == 0)
+            and kv_sharing_target_layer_name is None
+        )
+        self._cuda_window = self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
+        self._cuda_reserve = 0
+        if self._cuda_decode:
+            _CUDA_ATTN.ext()  # load the extension at startup, not during CUDA graph capture
+            try:
+                from vllm.config import get_current_vllm_config
+
+                vc = get_current_vllm_config()
+                self._cuda_reserve = max(
+                    vc.scheduler_config.max_num_seqs,
+                    vc.compilation_config.max_cudagraph_capture_size or 0,
+                )
+            except Exception:  # noqa: BLE001
+                self._cuda_reserve = 0
+            _k = (head_size, self._cuda_window, num_heads, num_kv_heads)
+            if _k not in _CUDA_ATTN_LOGGED:
+                _CUDA_ATTN_LOGGED.add(_k)
+                logger.info(
+                    "Turing CUDA decode attention enabled (int8 KV, head %d, window %d, q %d / kv %d)",
+                    head_size, self._cuda_window, num_heads, num_kv_heads,
+                )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -587,9 +630,38 @@ class TritonAttentionImpl(AttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
+            if self._cuda_decode and self._cuda_reserve:
+                # allocate the workspace now so the memory profiling accounts for it
+                _CUDA_ATTN.workspace(
+                    query.device, self._cuda_reserve, self.num_heads,
+                    self.num_kv_heads * -(-(self.num_heads // self.num_kv_heads) // 8),
+                    self.head_size, _CUDA_ATTN.nsplit_max(self._cuda_window),
+                )
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
+
+        # [Turing] decode-only batch; decided from Python values only (no sync)
+        if (
+            self._cuda_decode
+            and attn_metadata.max_query_len == 1
+            and output_scale is None
+            and attn_metadata.mm_prefix_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+            and attn_metadata.causal is True
+            and query.dtype == torch.float16
+        ):
+            self._ensure_scale_caches(kv_cache)
+            n = attn_metadata.num_actual_tokens
+            q3 = query[:n].view(n, self.num_heads, self.head_size)
+            o3 = output[:n].view(n, self.num_heads, self.head_size)
+            _CUDA_ATTN.decode(
+                q3, o3, kv_cache, self.head_size, attn_metadata.block_table,
+                attn_metadata.seq_lens, attn_metadata.query_start_loc,
+                window=self._cuda_window, scale=self.scale, softcap=self.logits_soft_cap,
+                reserve=self._cuda_reserve,
+            )
+            return output
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
